@@ -16,12 +16,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
-
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
 # ---------------------------------------------------------------------------
@@ -57,6 +51,60 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
+def is_rocm():
+    return getattr(torch.version, "hip", None) is not None
+
+
+def get_runtime_device():
+    if not torch.cuda.is_available():
+        raise RuntimeError("This script requires a GPU device.")
+    return torch.device("cuda")
+
+
+def get_runtime_dtype():
+    return torch.float16 if is_rocm() else torch.bfloat16
+
+
+def should_use_compile():
+    return not is_rocm()
+
+
+def get_peak_flops():
+    return None if is_rocm() else 989.5e12
+
+
+def causal_attention(q, k, v, window_size):
+    if not is_rocm():
+        from kernels import get_kernel
+
+        cap = torch.cuda.get_device_capability()
+        # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
+        repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+        fa3 = get_kernel(repo).flash_attn_interface
+        return fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+
+    q_t = q.transpose(1, 2)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
+    if k_t.size(1) != q_t.size(1):
+        repeat = q_t.size(1) // k_t.size(1)
+        k_t = k_t.repeat_interleave(repeat, dim=1)
+        v_t = v_t.repeat_interleave(repeat, dim=1)
+
+    attn_mask = None
+    left_window = window_size[0] if window_size is not None else None
+    if left_window is not None and left_window > 0 and left_window < q_t.size(-2):
+        seq_len = q_t.size(-2)
+        q_pos = torch.arange(seq_len, device=q.device).view(seq_len, 1)
+        k_pos = torch.arange(seq_len, device=q.device).view(1, seq_len)
+        attn_mask = (k_pos <= q_pos) & ((q_pos - k_pos) < left_window)
+
+    y = F.scaled_dot_product_attention(
+        q_t, k_t, v_t, attn_mask=attn_mask, is_causal=attn_mask is None
+    )
+    return y.transpose(1, 2)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -89,7 +137,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = causal_attention(q, k, v, window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -174,10 +222,10 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
+        runtime_dtype = get_runtime_dtype()
+        self.transformer.wte.to(dtype=runtime_dtype)
         for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+            ve.to(dtype=runtime_dtype)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -187,7 +235,8 @@ class GPT(nn.Module):
         t = torch.arange(seq_len, dtype=torch.float32, device=device)
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
+        runtime_dtype = get_runtime_dtype()
+        cos, sin = cos.to(dtype=runtime_dtype), sin.to(dtype=runtime_dtype)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :]
         return cos, sin
 
@@ -301,7 +350,6 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -312,7 +360,6 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -320,7 +367,7 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     momentum_buffer.lerp_(stacked_grads, 1 - momentum)
     g = stacked_grads.lerp_(momentum_buffer, momentum)
     # Polar express orthogonalization
-    X = g.bfloat16()
+    X = g.to(dtype=get_runtime_dtype())
     X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
     if g.size(-2) > g.size(-1):
         for a, b, c in polar_express_coeffs[:ns_steps]:
@@ -455,11 +502,13 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 t_start = time.time()
 torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+device = get_runtime_device()
+runtime_dtype = get_runtime_dtype()
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=runtime_dtype)
+peak_flops = get_peak_flops()
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -504,7 +553,10 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-model = torch.compile(model, dynamic=False)
+if should_use_compile():
+    adamw_step_fused = torch.compile(adamw_step_fused, dynamic=False, fullgraph=True)
+    muon_step_fused = torch.compile(muon_step_fused, dynamic=False, fullgraph=True)
+    model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -583,10 +635,11 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = None if peak_flops is None else 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / peak_flops
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    mfu_str = "n/a" if mfu is None else f"{mfu:.1f}%"
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu_str} | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -614,7 +667,7 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = None if peak_flops is None or total_training_time <= 0 else 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / peak_flops
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
@@ -622,7 +675,7 @@ print(f"val_bpb:          {val_bpb:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
+print(f"mfu_percent:      {'n/a' if steady_state_mfu is None else f'{steady_state_mfu:.2f}'}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
